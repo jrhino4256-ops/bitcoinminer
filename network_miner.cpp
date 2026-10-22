@@ -11,6 +11,54 @@
 #include <random>
 #include <atomic>
 #include <mutex>
+#include <memory>
+#include <algorithm>
+
+// Hex and serialization helpers
+static std::vector<uint8_t> hexToBytes(const std::string& hex) {
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i + 1 < hex.length(); i += 2) {
+        bytes.push_back(std::stoi(hex.substr(i, 2), nullptr, 16));
+    }
+    return bytes;
+}
+
+static std::string bytesToHex(const std::vector<uint8_t>& bytes) {
+    std::stringstream ss;
+    for (uint8_t byte : bytes) {
+        ss << std::hex << std::setfill('0') << std::setw(2) << (int)byte;
+    }
+    return ss.str();
+}
+
+static void writeLE32(std::vector<uint8_t>& out, uint32_t value) {
+    for (int i = 0; i < 4; i++) {
+        out.push_back((value >> (i * 8)) & 0xFF);
+    }
+}
+
+static void writeLE64(std::vector<uint8_t>& out, uint64_t value) {
+    for (int i = 0; i < 8; i++) {
+        out.push_back((value >> (i * 8)) & 0xFF);
+    }
+}
+
+// Bitcoin CompactSize integer
+static void writeVarInt(std::vector<uint8_t>& out, uint64_t value) {
+    if (value < 0xFD) {
+        out.push_back(value);
+    } else if (value <= 0xFFFF) {
+        out.push_back(0xFD);
+        out.push_back(value & 0xFF);
+        out.push_back((value >> 8) & 0xFF);
+    } else if (value <= 0xFFFFFFFF) {
+        out.push_back(0xFE);
+        writeLE32(out, value);
+    } else {
+        out.push_back(0xFF);
+        writeLE64(out, value);
+    }
+}
 
 // SHA-256 implementation (same as before)
 class SHA256 {
@@ -48,6 +96,15 @@ private:
 
 public:
     static std::string hash(const std::vector<uint8_t>& input) {
+        return bytesToHex(digest(input));
+    }
+
+    // Bitcoin's double SHA-256, used for block hashes, txids and merkle nodes
+    static std::vector<uint8_t> doubleDigest(const std::vector<uint8_t>& input) {
+        return digest(digest(input));
+    }
+
+    static std::vector<uint8_t> digest(const std::vector<uint8_t>& input) {
         std::vector<uint8_t> message = input;
         
         // Pre-processing: adding padding bits
@@ -106,20 +163,15 @@ public:
             h[4] += e; h[5] += f; h[6] += g; h[7] += h_val;
         }
         
-        // Produce the final hash value as bytes (little-endian for Bitcoin)
+        // Produce the final hash value as bytes (big-endian words, per the SHA-256 spec)
         std::vector<uint8_t> result;
         for (int i = 0; i < 8; i++) {
-            result.push_back(h[i] & 0xFF);
-            result.push_back((h[i] >> 8) & 0xFF);
-            result.push_back((h[i] >> 16) & 0xFF);
             result.push_back((h[i] >> 24) & 0xFF);
+            result.push_back((h[i] >> 16) & 0xFF);
+            result.push_back((h[i] >> 8) & 0xFF);
+            result.push_back(h[i] & 0xFF);
         }
-        
-        std::stringstream ss;
-        for (uint8_t byte : result) {
-            ss << std::hex << std::setfill('0') << std::setw(2) << (int)byte;
-        }
-        return ss.str();
+        return result;
     }
 };
 
@@ -156,7 +208,8 @@ private:
     std::string username;
     std::string password;
     CURL* curl;
-    
+    std::mutex curlMutex;  // A CURL easy handle must not be used by two threads at once
+
 public:
     BitcoinRPCClient(const std::string& url, const std::string& user, const std::string& pass) 
         : rpcUrl(url), username(user), password(pass) {
@@ -172,7 +225,9 @@ public:
         }
     }
     
-    Json::Value makeRPCCall(const std::string& method, const Json::Value& params = Json::Value()) {
+    Json::Value makeRPCCall(const std::string& method, const Json::Value& params = Json::Value(Json::arrayValue)) {
+        std::lock_guard<std::mutex> lock(curlMutex);
+
         if (!curl) {
             throw std::runtime_error("CURL not initialized");
         }
@@ -231,9 +286,9 @@ public:
 // Bitcoin Block Template
 struct BlockTemplate {
     std::string previousBlockHash;
-    std::string coinbaseHex;
-    std::vector<std::string> transactions;
-    std::string merkleRoot;
+    std::vector<uint8_t> coinbaseTx;        // Serialized coinbase, with witness
+    std::vector<std::string> transactions;  // Raw hex of the other transactions
+    std::vector<uint8_t> merkleRoot;        // Internal byte order
     uint32_t version;
     uint32_t bits;
     uint32_t curTime;
@@ -255,11 +310,8 @@ struct BlockTemplate {
             header.push_back(std::stoi(byteStr, nullptr, 16));
         }
         
-        // Merkle root (32 bytes, reversed)
-        for (int i = 31; i >= 0; i--) {
-            std::string byteStr = merkleRoot.substr(i * 2, 2);
-            header.push_back(std::stoi(byteStr, nullptr, 16));
-        }
+        // Merkle root (32 bytes, already in internal byte order)
+        header.insert(header.end(), merkleRoot.begin(), merkleRoot.end());
         
         // Timestamp (4 bytes, little-endian)
         header.push_back(curTime & 0xFF);
@@ -292,83 +344,147 @@ private:
     std::atomic<uint64_t> hashCount;
     std::chrono::steady_clock::time_point startTime;
     std::mutex templateMutex;
-    
-    std::string hexToReversedHex(const std::string& hex) {
-        std::string result;
-        for (int i = hex.length() - 2; i >= 0; i -= 2) {
-            result += hex.substr(i, 2);
+    std::vector<uint8_t> payoutScript;
+    uint32_t extraNonce = 0;
+
+    // Block hashes are compared as 256-bit numbers, so reverse the digest into
+    // display order (most significant byte first) before printing or comparing
+    static std::string toDisplayHex(const std::vector<uint8_t>& hash) {
+        return bytesToHex(std::vector<uint8_t>(hash.rbegin(), hash.rend()));
+    }
+
+    bool isValidHash(const std::vector<uint8_t>& hash) {
+        // Equal-length lowercase hex strings compare the same way as the numbers
+        return toDisplayHex(hash) <= currentTemplate.target;
+    }
+
+    // BIP34: the coinbase scriptSig must start with the block height, pushed the
+    // way Bitcoin Core does it (OP_0 / OP_1..OP_16 for small heights)
+    static std::vector<uint8_t> encodeHeight(uint32_t height) {
+        if (height == 0) return {0x00};
+        if (height <= 16) return {static_cast<uint8_t>(0x50 + height)};
+
+        std::vector<uint8_t> num;
+        for (uint32_t h = height; h > 0; h >>= 8) {
+            num.push_back(h & 0xFF);
         }
-        return result;
+        if (num.back() & 0x80) num.push_back(0x00);  // Keep the number positive
+
+        std::vector<uint8_t> script = {static_cast<uint8_t>(num.size())};
+        script.insert(script.end(), num.begin(), num.end());
+        return script;
     }
-    
-    bool isValidHash(const std::string& hash) {
-        // Compare hash with target (both are hex strings)
-        return hash < currentTemplate.target;
+
+    // Serialize the coinbase transaction paying the block reward to payoutScript.
+    // withWitness adds the BIP141 witness reserved value that the witness
+    // commitment requires; the txid is computed without it.
+    std::vector<uint8_t> buildCoinbase(uint32_t height, uint64_t value,
+                                       const std::vector<uint8_t>& witnessCommitment, bool withWitness) const {
+        std::vector<uint8_t> tx;
+        writeLE32(tx, 2);  // Version
+        if (withWitness) {
+            tx.push_back(0x00);  // Marker
+            tx.push_back(0x01);  // Flag
+        }
+
+        // Single input spending the null outpoint
+        tx.push_back(1);
+        tx.insert(tx.end(), 32, 0x00);
+        writeLE32(tx, 0xFFFFFFFF);
+
+        // scriptSig: height, then an extra nonce that makes each coinbase unique
+        // and keeps the script above the 2-byte consensus minimum
+        std::vector<uint8_t> scriptSig = encodeHeight(height);
+        scriptSig.push_back(4);
+        writeLE32(scriptSig, extraNonce);
+        writeVarInt(tx, scriptSig.size());
+        tx.insert(tx.end(), scriptSig.begin(), scriptSig.end());
+        writeLE32(tx, 0xFFFFFFFF);  // Sequence
+
+        // Outputs: block reward, plus the witness commitment if the template has one
+        writeVarInt(tx, witnessCommitment.empty() ? 1 : 2);
+        writeLE64(tx, value);
+        writeVarInt(tx, payoutScript.size());
+        tx.insert(tx.end(), payoutScript.begin(), payoutScript.end());
+        if (!witnessCommitment.empty()) {
+            writeLE64(tx, 0);
+            writeVarInt(tx, witnessCommitment.size());
+            tx.insert(tx.end(), witnessCommitment.begin(), witnessCommitment.end());
+        }
+
+        if (withWitness) {
+            tx.push_back(1);   // One witness item
+            tx.push_back(32);  // 32-byte witness reserved value
+            tx.insert(tx.end(), 32, 0x00);
+        }
+
+        writeLE32(tx, 0);  // Lock time
+        return tx;
     }
-    
+
     void updateBlockTemplate() {
         try {
             std::lock_guard<std::mutex> lock(templateMutex);
-            
-            Json::Value result = rpcClient->makeRPCCall("getblocktemplate");
-            
+
+            Json::Value request;
+            request["rules"].append("segwit");
+            Json::Value params;
+            params.append(request);
+
+            Json::Value result = rpcClient->makeRPCCall("getblocktemplate", params);
+
             currentTemplate.version = result["version"].asUInt();
             currentTemplate.previousBlockHash = result["previousblockhash"].asString();
             currentTemplate.bits = std::stoul(result["bits"].asString(), nullptr, 16);
             currentTemplate.curTime = result["curtime"].asUInt();
             currentTemplate.height = result["height"].asUInt();
             currentTemplate.target = result["target"].asString();
-            
+
             // Build coinbase transaction
-            currentTemplate.coinbaseHex = result["coinbasetxn"]["data"].asString();
-            
-            // Calculate merkle root
-            std::vector<std::string> txHashes;
-            txHashes.push_back(SHA256::hash(std::vector<uint8_t>(currentTemplate.coinbaseHex.begin(), currentTemplate.coinbaseHex.end())));
-            
+            extraNonce++;
+            std::vector<uint8_t> commitment = hexToBytes(result.get("default_witness_commitment", "").asString());
+            uint64_t reward = result["coinbasevalue"].asUInt64();
+            currentTemplate.coinbaseTx = buildCoinbase(currentTemplate.height, reward, commitment, !commitment.empty());
+
+            // Calculate merkle root from txids (internal byte order, no witness data)
+            std::vector<std::vector<uint8_t>> txids;
+            txids.push_back(SHA256::doubleDigest(buildCoinbase(currentTemplate.height, reward, commitment, false)));
+
+            currentTemplate.transactions.clear();
             for (const auto& tx : result["transactions"]) {
-                txHashes.push_back(tx["hash"].asString());
+                std::vector<uint8_t> txid = hexToBytes(tx["txid"].asString());
+                std::reverse(txid.begin(), txid.end());
+                txids.push_back(txid);
+                currentTemplate.transactions.push_back(tx["data"].asString());
             }
-            
-            // Calculate merkle root (simplified)
-            currentTemplate.merkleRoot = calculateMerkleRoot(txHashes);
-            
-            std::cout << "Updated block template - Height: " << currentTemplate.height 
+
+            currentTemplate.merkleRoot = calculateMerkleRoot(txids);
+
+            std::cout << "Updated block template - Height: " << currentTemplate.height
+                      << ", Transactions: " << currentTemplate.transactions.size()
                       << ", Target: " << currentTemplate.target.substr(0, 16) << "..." << std::endl;
-                      
+
         } catch (const std::exception& e) {
             std::cerr << "Failed to update block template: " << e.what() << std::endl;
         }
     }
-    
-    std::string calculateMerkleRoot(std::vector<std::string> hashes) {
-        if (hashes.empty()) return "";
-        if (hashes.size() == 1) return hashes[0];
-        
+
+    std::vector<uint8_t> calculateMerkleRoot(std::vector<std::vector<uint8_t>> hashes) {
+        if (hashes.empty()) return std::vector<uint8_t>(32, 0x00);
+
         while (hashes.size() > 1) {
-            std::vector<std::string> newLevel;
+            std::vector<std::vector<uint8_t>> newLevel;
             for (size_t i = 0; i < hashes.size(); i += 2) {
-                std::string left = hashes[i];
-                std::string right = (i + 1 < hashes.size()) ? hashes[i + 1] : left;
-                
-                std::vector<uint8_t> combined;
-                for (size_t j = 0; j < left.length(); j += 2) {
-                    combined.push_back(std::stoi(left.substr(j, 2), nullptr, 16));
-                }
-                for (size_t j = 0; j < right.length(); j += 2) {
-                    combined.push_back(std::stoi(right.substr(j, 2), nullptr, 16));
-                }
-                
-                std::string doubleHash = SHA256::hash(combined);
-                std::vector<uint8_t> hashBytes;
-                for (size_t j = 0; j < doubleHash.length(); j += 2) {
-                    hashBytes.push_back(std::stoi(doubleHash.substr(j, 2), nullptr, 16));
-                }
-                newLevel.push_back(SHA256::hash(hashBytes));
+                // An odd node out is paired with itself
+                const std::vector<uint8_t>& right = (i + 1 < hashes.size()) ? hashes[i + 1] : hashes[i];
+
+                std::vector<uint8_t> combined = hashes[i];
+                combined.insert(combined.end(), right.begin(), right.end());
+                newLevel.push_back(SHA256::doubleDigest(combined));
             }
             hashes = newLevel;
         }
-        
+
         return hashes[0];
     }
     
@@ -391,18 +507,28 @@ private:
     }
     
 public:
-    NetworkBitcoinMiner(const std::string& rpcUrl, const std::string& username, const std::string& password)
+    NetworkBitcoinMiner(const std::string& rpcUrl, const std::string& username, const std::string& password,
+                        const std::string& payoutAddress)
         : mining(false), hashCount(0) {
         rpcClient = std::make_unique<BitcoinRPCClient>(rpcUrl, username, password);
-        
+
         // Test connection
         try {
             Json::Value info = rpcClient->makeRPCCall("getblockchaininfo");
-            std::cout << "Connected to Bitcoin Core - Chain: " << info["chain"].asString() 
+            std::cout << "Connected to Bitcoin Core - Chain: " << info["chain"].asString()
                       << ", Blocks: " << info["blocks"].asUInt() << std::endl;
         } catch (const std::exception& e) {
             throw std::runtime_error("Failed to connect to Bitcoin Core: " + std::string(e.what()));
         }
+
+        // Resolve the payout address to the script the coinbase pays
+        Json::Value params;
+        params.append(payoutAddress);
+        Json::Value address = rpcClient->makeRPCCall("validateaddress", params);
+        if (!address["isvalid"].asBool()) {
+            throw std::runtime_error("Invalid payout address for this chain: " + payoutAddress);
+        }
+        payoutScript = hexToBytes(address["scriptPubKey"].asString());
     }
     
     void startMining() {
@@ -430,43 +556,48 @@ public:
             uint32_t nonce = 0;
             
             while (mining.load()) {
-                std::lock_guard<std::mutex> lock(templateMutex);
-                
-                if (currentTemplate.target.empty()) {
+                bool haveTemplate = false;
+                std::string blockHex;
+
+                {
+                    std::lock_guard<std::mutex> lock(templateMutex);
+
+                    if (!currentTemplate.target.empty()) {
+                        haveTemplate = true;
+
+                        // Double SHA-256 of the block header
+                        std::vector<uint8_t> hash = SHA256::doubleDigest(currentTemplate.getBlockHeader(nonce));
+                        hashCount.fetch_add(1);
+
+                        if (isValidHash(hash)) {
+                            std::cout << "✓ BLOCK FOUND!" << std::endl;
+                            std::cout << "Hash: " << toDisplayHex(hash) << std::endl;
+                            std::cout << "Nonce: " << nonce << std::endl;
+                            std::cout << "Height: " << currentTemplate.height << std::endl;
+
+                            blockHex = createBlockHex(nonce);
+                        }
+                    }
+                }
+
+                if (!haveTemplate) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     continue;
                 }
-                
-                // Get block header
-                std::vector<uint8_t> header = currentTemplate.getBlockHeader(nonce);
-                
-                // Double SHA-256
-                std::string hash = SHA256::hash(header);
-                std::vector<uint8_t> hashBytes;
-                for (size_t i = 0; i < hash.length(); i += 2) {
-                    hashBytes.push_back(std::stoi(hash.substr(i, 2), nullptr, 16));
-                }
-                hash = SHA256::hash(hashBytes);
-                
-                hashCount.fetch_add(1);
-                
-                if (isValidHash(hash)) {
-                    std::cout << "✓ BLOCK FOUND!" << std::endl;
-                    std::cout << "Hash: " << hash << std::endl;
-                    std::cout << "Nonce: " << nonce << std::endl;
-                    std::cout << "Height: " << currentTemplate.height << std::endl;
-                    
-                    // Submit block to network
-                    std::string blockHex = createBlockHex(nonce);
+
+                // Submit and refresh outside the lock, since updateBlockTemplate takes it too
+                if (!blockHex.empty()) {
                     submitBlock(blockHex);
-                    
-                    // Get new template
                     updateBlockTemplate();
                     nonce = 0;
                 } else {
                     nonce++;
                     if (nonce % 1000000 == 0) {
                         printStats();
+                    }
+                    // Nonce space exhausted: a fresh template gets a new extra nonce
+                    if (nonce == 0) {
+                        updateBlockTemplate();
                     }
                 }
             }
@@ -494,19 +625,16 @@ public:
     
 private:
     std::string createBlockHex(uint32_t nonce) {
-        // This is a simplified block creation
-        // In reality, you'd need to build the complete block with all transactions
-        std::vector<uint8_t> header = currentTemplate.getBlockHeader(nonce);
-        
-        std::stringstream ss;
-        for (uint8_t byte : header) {
-            ss << std::hex << std::setfill('0') << std::setw(2) << (int)byte;
+        // Header, transaction count, coinbase, then the template's transactions
+        std::vector<uint8_t> block = currentTemplate.getBlockHeader(nonce);
+        writeVarInt(block, 1 + currentTemplate.transactions.size());
+        block.insert(block.end(), currentTemplate.coinbaseTx.begin(), currentTemplate.coinbaseTx.end());
+
+        std::string blockHex = bytesToHex(block);
+        for (const auto& tx : currentTemplate.transactions) {
+            blockHex += tx;
         }
-        
-        // Add coinbase transaction and other transactions
-        ss << currentTemplate.coinbaseHex;
-        
-        return ss.str();
+        return blockHex;
     }
 };
 
@@ -525,12 +653,16 @@ int main() {
     
     std::cout << "Enter RPC password: ";
     std::getline(std::cin, password);
-    
+
+    std::string payoutAddress;
+    std::cout << "Enter payout address for block rewards: ";
+    std::getline(std::cin, payoutAddress);
+
     try {
         // Initialize CURL
         curl_global_init(CURL_GLOBAL_DEFAULT);
-        
-        NetworkBitcoinMiner miner(rpcUrl, username, password);
+
+        NetworkBitcoinMiner miner(rpcUrl, username, password, payoutAddress);
         
         std::cout << "\nStarting network mining..." << std::endl;
         std::cout << "Press Ctrl+C to stop." << std::endl;
