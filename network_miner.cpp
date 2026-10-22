@@ -11,6 +11,7 @@
 #include <random>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <algorithm>
 
@@ -41,6 +42,11 @@ static void writeLE64(std::vector<uint8_t>& out, uint64_t value) {
     for (int i = 0; i < 8; i++) {
         out.push_back((value >> (i * 8)) & 0xFF);
     }
+}
+
+static uint32_t readBE32(const uint8_t* bytes) {
+    return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) |
+           (uint32_t(bytes[2]) << 8) | uint32_t(bytes[3]);
 }
 
 // Bitcoin CompactSize integer
@@ -95,6 +101,46 @@ private:
     }
 
 public:
+    static void init(uint32_t state[8]) {
+        std::copy(H0, H0 + 8, state);
+    }
+
+    // SHA-256 compression function: mixes one 64-byte block, given as sixteen
+    // big-endian words, into state
+    static void compress(uint32_t state[8], const uint32_t block[16]) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++) {
+            w[i] = block[i];
+        }
+
+        // Extend the first 16 words into the remaining 48 words
+        for (int i = 16; i < 64; i++) {
+            w[i] = gamma1(w[i - 2]) + w[i - 7] + gamma0(w[i - 15]) + w[i - 16];
+        }
+
+        // Initialize hash value for this chunk
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+        uint32_t e = state[4], f = state[5], g = state[6], h_val = state[7];
+
+        // Main loop
+        for (int i = 0; i < 64; i++) {
+            uint32_t temp1 = h_val + sig1(e) + ch(e, f, g) + K[i] + w[i];
+            uint32_t temp2 = sig0(a) + maj(a, b, c);
+            h_val = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
+        }
+
+        // Add this chunk's hash to result so far
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+        state[4] += e; state[5] += f; state[6] += g; state[7] += h_val;
+    }
+
     static std::string hash(const std::vector<uint8_t>& input) {
         return bytesToHex(digest(input));
     }
@@ -122,45 +168,21 @@ public:
         }
         
         // Process the message in successive 512-bit chunks
-        std::vector<uint32_t> h = {H0[0], H0[1], H0[2], H0[3], H0[4], H0[5], H0[6], H0[7]};
-        
+        uint32_t h[8];
+        init(h);
+
         for (size_t chunk = 0; chunk < message.size(); chunk += 64) {
-            uint32_t w[64];
-            
+            uint32_t block[16];
+
             // Break chunk into sixteen 32-bit big-endian words
             for (int i = 0; i < 16; i++) {
-                w[i] = (message[chunk + i * 4] << 24) |
-                       (message[chunk + i * 4 + 1] << 16) |
-                       (message[chunk + i * 4 + 2] << 8) |
-                       (message[chunk + i * 4 + 3]);
+                block[i] = (message[chunk + i * 4] << 24) |
+                           (message[chunk + i * 4 + 1] << 16) |
+                           (message[chunk + i * 4 + 2] << 8) |
+                           (message[chunk + i * 4 + 3]);
             }
-            
-            // Extend the first 16 words into the remaining 48 words
-            for (int i = 16; i < 64; i++) {
-                w[i] = gamma1(w[i - 2]) + w[i - 7] + gamma0(w[i - 15]) + w[i - 16];
-            }
-            
-            // Initialize hash value for this chunk
-            uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
-            uint32_t e = h[4], f = h[5], g = h[6], h_val = h[7];
-            
-            // Main loop
-            for (int i = 0; i < 64; i++) {
-                uint32_t temp1 = h_val + sig1(e) + ch(e, f, g) + K[i] + w[i];
-                uint32_t temp2 = sig0(a) + maj(a, b, c);
-                h_val = g;
-                g = f;
-                f = e;
-                e = d + temp1;
-                d = c;
-                c = b;
-                b = a;
-                a = temp1 + temp2;
-            }
-            
-            // Add this chunk's hash to result so far
-            h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-            h[4] += e; h[5] += f; h[6] += g; h[7] += h_val;
+
+            compress(h, block);
         }
         
         // Produce the final hash value as bytes (big-endian words, per the SHA-256 spec)
@@ -335,6 +357,15 @@ struct BlockTemplate {
     }
 };
 
+// Per-template data the hashing threads need. The first 64 header bytes don't
+// depend on the nonce, so their SHA-256 state is computed once and each nonce
+// costs two compressions instead of hashing the full header twice.
+struct MiningWork {
+    uint32_t midstate[8];  // SHA-256 state after header bytes 0-63
+    uint32_t tail[3];      // Header bytes 64-75 (end of merkle root, time, bits)
+    uint32_t target[8];    // Target as 32-bit words, most significant first
+};
+
 // Network Bitcoin Miner
 class NetworkBitcoinMiner {
 private:
@@ -346,6 +377,143 @@ private:
     std::mutex templateMutex;
     std::vector<uint8_t> payoutScript;
     uint32_t extraNonce = 0;
+
+    // Hashing threads poll workGeneration and reload currentWork when it changes
+    MiningWork currentWork;
+    std::atomic<uint64_t> workGeneration{0};
+    std::condition_variable workChanged;  // Signalled under templateMutex
+    std::atomic<uint64_t> solvedGeneration{0};
+    std::atomic<uint64_t> blocksAccepted{0};
+    unsigned threadCount;
+
+    MiningWork buildWork() const {
+        MiningWork work{};
+        std::vector<uint8_t> header = currentTemplate.getBlockHeader(0);
+
+        uint32_t block[16];
+        for (int i = 0; i < 16; i++) {
+            block[i] = readBE32(&header[i * 4]);
+        }
+        SHA256::init(work.midstate);
+        SHA256::compress(work.midstate, block);
+
+        for (int i = 0; i < 3; i++) {
+            work.tail[i] = readBE32(&header[64 + i * 4]);
+        }
+
+        std::vector<uint8_t> target = hexToBytes(currentTemplate.target);
+        if (target.size() != 32) {
+            throw std::runtime_error("Unexpected target length: " + currentTemplate.target);
+        }
+        for (int i = 0; i < 8; i++) {
+            work.target[i] = readBE32(&target[i * 4]);
+        }
+        return work;
+    }
+
+    // Fast path: double SHA-256 of the header with this nonce, checked against the target
+    static bool checkNonce(const MiningWork& work, uint32_t nonce) {
+        // Second header chunk: bytes 64-79 plus padding for an 80-byte message.
+        // The nonce is stored little-endian, so as a big-endian word it is byte-swapped.
+        uint32_t block[16] = {work.tail[0], work.tail[1], work.tail[2], __builtin_bswap32(nonce),
+                              0x80000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80 * 8};
+        uint32_t state[8];
+        std::copy(work.midstate, work.midstate + 8, state);
+        SHA256::compress(state, block);
+
+        // Second SHA-256 over the 32-byte first digest
+        uint32_t block2[16] = {state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
+                               0x80000000, 0, 0, 0, 0, 0, 0, 32 * 8};
+        uint32_t hash[8];
+        SHA256::init(hash);
+        SHA256::compress(hash, block2);
+
+        // As a number the hash is little-endian, so its most significant word is
+        // the byte-swapped last word of the digest
+        for (int i = 0; i < 8; i++) {
+            uint32_t word = __builtin_bswap32(hash[7 - i]);
+            if (word != work.target[i]) {
+                return word < work.target[i];
+            }
+        }
+        return true;
+    }
+
+    // Each thread tries nonces id, id + threadCount, id + 2 * threadCount, ...
+    void hashWorker(unsigned id) {
+        const uint32_t batchSize = 1 << 16;
+        MiningWork work{};
+        uint64_t generation = 0;
+        uint32_t nonce = 0;
+        bool exhausted = false;
+
+        while (mining.load()) {
+            if (workGeneration.load() != generation) {
+                std::lock_guard<std::mutex> lock(templateMutex);
+                work = currentWork;
+                generation = workGeneration.load();
+                nonce = id;
+                exhausted = false;
+            }
+
+            // Wait for a first template, or a new one once this one is solved or
+            // this thread's nonces are used up (the template thread refreshes it)
+            if (generation == 0 || solvedGeneration.load() == generation || exhausted) {
+                std::unique_lock<std::mutex> lock(templateMutex);
+                workChanged.wait_for(lock, std::chrono::milliseconds(100),
+                                     [&]() { return workGeneration.load() != generation || !mining.load(); });
+                continue;
+            }
+
+            uint32_t done = 0;
+            while (done < batchSize) {
+                done++;
+                if (checkNonce(work, nonce)) {
+                    submitSolution(generation, nonce);
+                    break;
+                }
+                uint32_t next = nonce + threadCount;
+                if (next < nonce) {
+                    exhausted = true;
+                    break;
+                }
+                nonce = next;
+            }
+            hashCount.fetch_add(done);
+        }
+    }
+
+    void submitSolution(uint64_t generation, uint32_t nonce) {
+        std::string blockHex;
+
+        {
+            std::lock_guard<std::mutex> lock(templateMutex);
+
+            // Another thread may have solved this template already, or it was replaced
+            if (workGeneration.load() != generation || solvedGeneration.load() == generation) {
+                return;
+            }
+
+            // Confirm with the reference implementation before submitting
+            std::vector<uint8_t> hash = SHA256::doubleDigest(currentTemplate.getBlockHeader(nonce));
+            if (!isValidHash(hash)) {
+                std::cerr << "Internal error: fast hash path disagrees for nonce " << nonce << std::endl;
+                return;
+            }
+            solvedGeneration.store(generation);
+
+            std::cout << "✓ BLOCK FOUND!" << std::endl;
+            std::cout << "Hash: " << toDisplayHex(hash) << std::endl;
+            std::cout << "Nonce: " << nonce << std::endl;
+            std::cout << "Height: " << currentTemplate.height << std::endl;
+
+            blockHex = createBlockHex(nonce);
+        }
+
+        // Submit and refresh outside the lock, since updateBlockTemplate takes it too
+        submitBlock(blockHex);
+        updateBlockTemplate();
+    }
 
     // Block hashes are compared as 256-bit numbers, so reverse the digest into
     // display order (most significant byte first) before printing or comparing
@@ -459,6 +627,10 @@ private:
             }
 
             currentTemplate.merkleRoot = calculateMerkleRoot(txids);
+            
+            currentWork = buildWork();
+            workGeneration.fetch_add(1);
+            workChanged.notify_all();
 
             std::cout << "Updated block template - Height: " << currentTemplate.height
                       << ", Transactions: " << currentTemplate.transactions.size()
@@ -496,6 +668,7 @@ private:
             Json::Value result = rpcClient->makeRPCCall("submitblock", params);
             
             if (result.isNull()) {
+                blocksAccepted.fetch_add(1);
                 std::cout << "✓ BLOCK ACCEPTED BY NETWORK!" << std::endl;
                 std::cout << "Congratulations! You've successfully mined a Bitcoin block!" << std::endl;
             } else {
@@ -529,6 +702,8 @@ public:
             throw std::runtime_error("Invalid payout address for this chain: " + payoutAddress);
         }
         payoutScript = hexToBytes(address["scriptPubKey"].asString());
+
+        threadCount = std::max(1u, std::thread::hardware_concurrency());
     }
     
     void startMining() {
@@ -541,9 +716,10 @@ public:
         hashCount.store(0);
         startTime = std::chrono::steady_clock::now();
         
-        std::cout << "Starting Bitcoin mining..." << std::endl;
+        std::cout << "Starting Bitcoin mining on " << threadCount << " threads..." << std::endl;
         
-        // Template update thread
+        // Template update thread; each refresh also bumps the extra nonce,
+        // giving the hashing threads a fresh nonce space
         std::thread templateThread([this]() {
             while (mining.load()) {
                 updateBlockTemplate();
@@ -551,60 +727,25 @@ public:
             }
         });
         
-        // Mining thread
-        std::thread miningThread([this]() {
-            uint32_t nonce = 0;
-            
+        // Stats thread
+        std::thread statsThread([this]() {
             while (mining.load()) {
-                bool haveTemplate = false;
-                std::string blockHex;
-
-                {
-                    std::lock_guard<std::mutex> lock(templateMutex);
-
-                    if (!currentTemplate.target.empty()) {
-                        haveTemplate = true;
-
-                        // Double SHA-256 of the block header
-                        std::vector<uint8_t> hash = SHA256::doubleDigest(currentTemplate.getBlockHeader(nonce));
-                        hashCount.fetch_add(1);
-
-                        if (isValidHash(hash)) {
-                            std::cout << "✓ BLOCK FOUND!" << std::endl;
-                            std::cout << "Hash: " << toDisplayHex(hash) << std::endl;
-                            std::cout << "Nonce: " << nonce << std::endl;
-                            std::cout << "Height: " << currentTemplate.height << std::endl;
-
-                            blockHex = createBlockHex(nonce);
-                        }
-                    }
-                }
-
-                if (!haveTemplate) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    continue;
-                }
-
-                // Submit and refresh outside the lock, since updateBlockTemplate takes it too
-                if (!blockHex.empty()) {
-                    submitBlock(blockHex);
-                    updateBlockTemplate();
-                    nonce = 0;
-                } else {
-                    nonce++;
-                    if (nonce % 1000000 == 0) {
-                        printStats();
-                    }
-                    // Nonce space exhausted: a fresh template gets a new extra nonce
-                    if (nonce == 0) {
-                        updateBlockTemplate();
-                    }
-                }
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                printStats();
             }
         });
         
+        // Hashing threads
+        std::vector<std::thread> workers;
+        for (unsigned i = 0; i < threadCount; i++) {
+            workers.emplace_back(&NetworkBitcoinMiner::hashWorker, this, i);
+        }
+        
         templateThread.join();
-        miningThread.join();
+        statsThread.join();
+        for (auto& worker : workers) {
+            worker.join();
+        }
     }
     
     void stopMining() {
@@ -618,8 +759,9 @@ public:
         
         if (duration.count() > 0) {
             double hashRate = hashCount.load() / static_cast<double>(duration.count());
-            std::cout << "Hash Rate: " << std::fixed << std::setprecision(2) << hashRate << " H/s"
-                      << " | Total Hashes: " << hashCount.load() << std::endl;
+            std::cout << "Hash Rate: " << std::fixed << std::setprecision(2) << hashRate / 1e6 << " MH/s"
+                      << " | Total Hashes: " << hashCount.load()
+                      << " | Blocks Accepted: " << blocksAccepted.load() << std::endl;
         }
     }
     

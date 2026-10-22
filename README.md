@@ -13,7 +13,7 @@ How It Works:
 
 Connection: Connects to your Bitcoin Core node (localhost:8332 by default)
 Template Retrieval: Gets current block template with transactions and builds the coinbase transaction paying your address
-Mining: Performs double SHA-256 hashing with proper Bitcoin protocol
+Mining: Performs double SHA-256 hashing with proper Bitcoin protocol, on one thread per CPU core
 Submission: Submits valid blocks to the network for verification
 
 Setup Requirements:
