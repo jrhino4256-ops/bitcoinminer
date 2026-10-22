@@ -66,6 +66,11 @@ static void writeVarInt(std::vector<uint8_t>& out, uint64_t value) {
     }
 }
 
+// Lane-wise operations for the SIMD hashing below. Macros rather than helper
+// functions, so the code compiles inside whichever target-specific function uses it.
+#define ROTR_LANES(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define BSWAP_LANES(x) (((x) << 24) | (((x) << 8) & 0x00FF0000) | (((x) >> 8) & 0x0000FF00) | ((x) >> 24))
+
 // SHA-256 implementation (same as before)
 class SHA256 {
 private:
@@ -137,6 +142,40 @@ public:
         }
 
         // Add this chunk's hash to result so far
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+        state[4] += e; state[5] += f; state[6] += g; state[7] += h_val;
+    }
+
+    // compress() on vectors of independent messages, one per lane (GCC vector
+    // extensions). Callers compile it for a SIMD instruction set by inlining it
+    // into a function with a target attribute; w holds the 16 block words and
+    // is used as the message schedule.
+    template <typename V>
+    static inline __attribute__((always_inline)) void compressLanes(V state[8], V w[64]) {
+#pragma GCC unroll 48
+        for (int i = 16; i < 64; i++) {
+            V s0 = ROTR_LANES(w[i - 15], 7) ^ ROTR_LANES(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            V s1 = ROTR_LANES(w[i - 2], 17) ^ ROTR_LANES(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = s1 + w[i - 7] + s0 + w[i - 16];
+        }
+
+        V a = state[0], b = state[1], c = state[2], d = state[3];
+        V e = state[4], f = state[5], g = state[6], h_val = state[7];
+
+#pragma GCC unroll 64
+        for (int i = 0; i < 64; i++) {
+            V temp1 = h_val + (ROTR_LANES(e, 6) ^ ROTR_LANES(e, 11) ^ ROTR_LANES(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+            V temp2 = (ROTR_LANES(a, 2) ^ ROTR_LANES(a, 13) ^ ROTR_LANES(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+            h_val = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
+        }
+
         state[0] += a; state[1] += b; state[2] += c; state[3] += d;
         state[4] += e; state[5] += f; state[6] += g; state[7] += h_val;
     }
@@ -366,6 +405,75 @@ struct MiningWork {
     uint32_t target[8];    // Target as 32-bit words, most significant first
 };
 
+// SIMD version of the header hash: lane i hashes nonce firstNonce + i. Returns a
+// bitmask of lanes whose hash passes on its most significant 32 bits; those are
+// candidates only, to be confirmed with the full comparison in checkNonce.
+template <typename V, int Lanes>
+static inline __attribute__((always_inline)) uint32_t scanGroup(const MiningWork& work, uint32_t firstNonce) {
+    V nonce;
+    for (int i = 0; i < Lanes; i++) {
+        nonce[i] = firstNonce + i;
+    }
+
+    // Second header chunk, as in checkNonce
+    V w[64];
+    for (int i = 0; i < 3; i++) {
+        w[i] = V{} + work.tail[i];
+    }
+    w[3] = BSWAP_LANES(nonce);
+    w[4] = V{} + 0x80000000;
+    for (int i = 5; i < 15; i++) {
+        w[i] = V{};
+    }
+    w[15] = V{} + 80 * 8;
+
+    V state[8];
+    for (int i = 0; i < 8; i++) {
+        state[i] = V{} + work.midstate[i];
+    }
+    SHA256::compressLanes(state, w);
+
+    // Second SHA-256 over the 32-byte first digest
+    for (int i = 0; i < 8; i++) {
+        w[i] = state[i];
+    }
+    w[8] = V{} + 0x80000000;
+    for (int i = 9; i < 15; i++) {
+        w[i] = V{};
+    }
+    w[15] = V{} + 32 * 8;
+
+    uint32_t initial[8];
+    SHA256::init(initial);
+    V hash[8];
+    for (int i = 0; i < 8; i++) {
+        hash[i] = V{} + initial[i];
+    }
+    SHA256::compressLanes(hash, w);
+
+    auto pass = BSWAP_LANES(hash[7]) <= (V{} + work.target[0]);
+    uint32_t mask = 0;
+    for (int i = 0; i < Lanes; i++) {
+        if (pass[i]) mask |= 1u << i;
+    }
+    return mask;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+typedef uint32_t Lanes8 __attribute__((vector_size(32)));
+typedef uint32_t Lanes16 __attribute__((vector_size(64)));
+
+__attribute__((target("avx2")))
+static uint32_t scanGroupAVX2(const MiningWork& work, uint32_t firstNonce) {
+    return scanGroup<Lanes8, 8>(work, firstNonce);
+}
+
+__attribute__((target("avx512f")))
+static uint32_t scanGroupAVX512(const MiningWork& work, uint32_t firstNonce) {
+    return scanGroup<Lanes16, 16>(work, firstNonce);
+}
+#endif
+
 // Network Bitcoin Miner
 class NetworkBitcoinMiner {
 private:
@@ -385,6 +493,9 @@ private:
     std::atomic<uint64_t> solvedGeneration{0};
     std::atomic<uint64_t> blocksAccepted{0};
     unsigned threadCount;
+    uint32_t (*scanGroupFn)(const MiningWork&, uint32_t);
+    unsigned scanLanes;
+    const char* hasherName;
 
     MiningWork buildWork() const {
         MiningWork work{};
@@ -439,23 +550,47 @@ private:
         return true;
     }
 
-    // Each thread tries nonces id, id + threadCount, id + 2 * threadCount, ...
+    static uint32_t scanGroupScalar(const MiningWork& work, uint32_t nonce) {
+        return checkNonce(work, nonce) ? 1 : 0;
+    }
+    
+    // Pick the widest SIMD hashing this CPU supports
+    void selectHasher() {
+        scanGroupFn = scanGroupScalar;
+        scanLanes = 1;
+        hasherName = "scalar";
+#if defined(__x86_64__) || defined(__i386__)
+        if (__builtin_cpu_supports("avx512f")) {
+            scanGroupFn = scanGroupAVX512;
+            scanLanes = 16;
+            hasherName = "AVX-512";
+        } else if (__builtin_cpu_supports("avx2")) {
+            scanGroupFn = scanGroupAVX2;
+            scanLanes = 8;
+            hasherName = "AVX2";
+        }
+#endif
+    }
+    
+    // The nonce space is split into groups of scanLanes consecutive nonces, hashed
+    // together; thread id takes groups id, id + threadCount, id + 2 * threadCount, ...
     void hashWorker(unsigned id) {
         const uint32_t batchSize = 1 << 16;
+        const uint32_t step = threadCount * scanLanes;
         MiningWork work{};
         uint64_t generation = 0;
         uint32_t nonce = 0;
         bool exhausted = false;
-
+        
         while (mining.load()) {
             if (workGeneration.load() != generation) {
                 std::lock_guard<std::mutex> lock(templateMutex);
                 work = currentWork;
                 generation = workGeneration.load();
-                nonce = id;
+                nonce = id * scanLanes;
                 exhausted = false;
             }
-
+            
             // Wait for a first template, or a new one once this one is solved or
             // this thread's nonces are used up (the template thread refreshes it)
             if (generation == 0 || solvedGeneration.load() == generation || exhausted) {
@@ -464,15 +599,20 @@ private:
                                      [&]() { return workGeneration.load() != generation || !mining.load(); });
                 continue;
             }
-
+            
             uint32_t done = 0;
-            while (done < batchSize) {
-                done++;
-                if (checkNonce(work, nonce)) {
-                    submitSolution(generation, nonce);
-                    break;
+            bool found = false;
+            while (done < batchSize && !found) {
+                done += scanLanes;
+                uint32_t candidates = scanGroupFn(work, nonce);
+                for (unsigned lane = 0; candidates != 0 && lane < scanLanes; lane++) {
+                    if ((candidates >> lane & 1) && checkNonce(work, nonce + lane)) {
+                        submitSolution(generation, nonce + lane);
+                        found = true;
+                        break;
+                    }
                 }
-                uint32_t next = nonce + threadCount;
+                uint32_t next = nonce + step;
                 if (next < nonce) {
                     exhausted = true;
                     break;
@@ -482,7 +622,7 @@ private:
             hashCount.fetch_add(done);
         }
     }
-
+    
     void submitSolution(uint64_t generation, uint32_t nonce) {
         std::string blockHex;
 
@@ -704,6 +844,7 @@ public:
         payoutScript = hexToBytes(address["scriptPubKey"].asString());
 
         threadCount = std::max(1u, std::thread::hardware_concurrency());
+        selectHasher();
     }
     
     void startMining() {
@@ -716,7 +857,8 @@ public:
         hashCount.store(0);
         startTime = std::chrono::steady_clock::now();
         
-        std::cout << "Starting Bitcoin mining on " << threadCount << " threads..." << std::endl;
+        std::cout << "Starting Bitcoin mining on " << threadCount << " threads, "
+                  << hasherName << " hashing (" << scanLanes << " nonces at a time)..." << std::endl;
         
         // Template update thread; each refresh also bumps the extra nonce,
         // giving the hashing threads a fresh nonce space
